@@ -39,6 +39,7 @@ _started = time.time()
 _ballast: list[bytearray] = []  # holds allocated memory so the RSS actually rises
 _ballast_lock = threading.Lock()
 _requests = 0
+_sick_until = 0.0  # epoch seconds until which /healthz deliberately fails
 _requests_lock = threading.Lock()
 
 
@@ -80,7 +81,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
-        global _requests
+        global _requests, _sick_until
         with _requests_lock:
             _requests += 1
 
@@ -91,7 +92,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # without a probe there is no signal that a specific replica actually serves requests —
         # container-is-running and tunnel-is-registered both proved to mean something weaker.
         if path == "/healthz":
+            if time.time() < _sick_until:
+                # Deliberately sick: 503 is a REFUSAL, not a timeout. Starving the process with /cpu
+                # cannot produce this — CFS still schedules the server often enough to answer a 1ms
+                # request inside its 3s probe timeout, so load makes a replica SLOW and never
+                # unhealthy. Only an explicit refusal makes Fleet probe-confirm a sick replica.
+                return self._send(503, {"ok": False, "sick": True, **_identity()})
             return self._send(200, {"ok": True, **_identity()})
+
+        # Fail health checks for N ms, then recover on their own. Self-limiting for the same reason
+        # /cpu is: a test that dies mid-run must not leave a replica sick forever.
+        if path == "/sick":
+            ms = max(0, min(int(args.get("ms", "60000")), 300000))
+            _sick_until = time.time() + ms / 1000.0
+            return self._send(200, {"sick_for_ms": ms, **_identity()})
 
         if path in ("/", "/info"):
             return self._send(200, _identity())
