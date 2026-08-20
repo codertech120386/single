@@ -6,11 +6,15 @@ scenario and then assert what actually happened rather than what should have hap
 
 Two design notes that matter, both learned from Fleet bugs rather than guessed:
 
-  1. /mem is the autoscale lever, NOT cpu. Fleet's autoscaler fires on MEMORY (as a percentage of
-     the app's tier) and on REQUEST RATE (only when `target_rps` is set on the app). It does not
-     look at CPU at all. A load test that pegs the CPU will scale nothing, and the natural
-     conclusion — "autoscaling is broken" — would be wrong. Drive /mem, or drive requests with
-     target_rps configured.
+  1. There are three autoscale levers and each needs its OWN endpoint. Fleet scales on MEMORY (a
+     percentage of the app's tier), on CPU (a percentage of a host core, and only when the app
+     carries a `cpu` scaling rule — the DEFAULT rule set is memory-only), and on REQUEST RATE (only
+     when `target_rps` is set). Driving the wrong one scales nothing, and the natural conclusion —
+     "autoscaling is broken" — would be wrong. Use /mem, /cpu, or requests with target_rps.
+
+     /cpu exists because request volume is NOT a usable CPU lever: measured on this app, ~2100 rps
+     cost about 31% of a core, so crossing a 70% threshold would need ~5k rps sustained through the
+     edge — which saturates the edge long before the app. One /cpu call replaces all of it.
 
   2. /info reports WHICH replica answered. Fleet places at most one replica of an app per node, so
      a scale-out is only real if requests start coming back from more than one hostname. Counting
@@ -22,6 +26,7 @@ never be mistaken for a slow placement.
 
 import http.server
 import json
+import multiprocessing
 import os
 import socket
 import threading
@@ -52,6 +57,15 @@ def _identity() -> dict:
         "held_mb": _ballast_mb(),
         "requests": _requests,
     }
+
+
+def _burn(seconds: float) -> None:
+    """Spin one core until the deadline. Deliberately trivial arithmetic: anything cleverer risks
+    being optimised away, or turning into memory traffic — which would move the WRONG signal."""
+    end = time.time() + seconds
+    while time.time() < end:
+        for _ in range(50000):
+            pass
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -96,6 +110,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _ballast_lock:
                 _ballast.clear()
             return self._send(200, {"released": True, **_identity()})
+
+        # Burn CPU for N ms and return NOW, so a test can drive the CPU signal without holding a
+        # request open for the whole burn.
+        #
+        # PROCESSES, not threads: the GIL means N busy THREADS still total about one core, so a
+        # `threads` knob would silently cap near 100% however high it was set. One process pegs one
+        # core, and Fleet sets no --cpus on the container, so cores=2 really does report ~200%.
+        #
+        # Self-limiting on purpose: every worker carries its own deadline, so a burn always ends even
+        # if the test dies mid-run. There is no /cpu/release to forget, unlike /mem.
+        if path == "/cpu":
+            ms = max(0, min(int(args.get("ms", "30000")), 300000))
+            cores = max(1, min(int(args.get("cores", "1")), 8))
+            for _ in range(cores):
+                multiprocessing.Process(target=_burn, args=(ms / 1000.0,), daemon=True).start()
+            return self._send(200, {"burning_ms": ms, "cores": cores, **_identity()})
 
         # Hold the connection open — useful for building queue depth without burning CPU.
         if path == "/slow":
