@@ -85,3 +85,9 @@ docker run --rm -p 8080:8080 scn-single
 curl localhost:8080/healthz
 curl "localhost:8080/mem?mb=64" && curl localhost:8080/info
 ```
+
+## Push→auto-redeploy check
+
+This line exists to trigger a push webhook, for the last unverified leg of
+Fleet Flow 1 (B44): a real `git push` on a connected branch should rebuild and
+redeploy without anyone pressing anything. Touched 2026-09-14.
