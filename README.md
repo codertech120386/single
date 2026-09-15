@@ -95,3 +95,5 @@ redeploy without anyone pressing anything. Touched 2026-09-14.
 B265 check: a push must now reach only a tenant bound to the delivering installation.
 
 B265: an unbound tenant now claims this repo too.
+
+B267: the connection was removed by the operator.
